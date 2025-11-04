@@ -91,7 +91,7 @@ async def create_browser():
     else:
         logger.info("🤖 PRODUCTION MODE: Headless browser")
         browser = await playwright.chromium.launch(
-            headless=True,
+            headless=false,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
