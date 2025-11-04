@@ -17,6 +17,9 @@ app = Flask(__name__)
 DICE_EMAIL = os.getenv("DICE_EMAIL", "your_email@dice.com")
 DICE_PASSWORD = os.getenv("DICE_PASSWORD", "your_password")
 
+# Debug mode - set to False for production/Render
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
+
 # Human behavior configuration
 MIN_WAIT_BETWEEN_APPS = 120
 MAX_WAIT_BETWEEN_APPS = 180
@@ -66,7 +69,7 @@ def enforce_human_pacing():
             time.sleep(wait_time)
 
 async def create_browser():
-    """Create optimized browser for Render"""
+    """Create browser - headed mode for debugging"""
     playwright = await async_playwright().start()
     
     user_agents = [
@@ -74,29 +77,41 @@ async def create_browser():
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     ]
     
-    # Render-optimized browser launch
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',  # Critical for Render
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-gpu',
-            '--single-process',  # Use single process on Render
-            '--no-zygote',
-            '--disable-software-rasterizer',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-        ]
-    )
+    # Browser launch configuration
+    if DEBUG_MODE:
+        logger.info("🔍 DEBUG MODE: Browser will be visible")
+        browser = await playwright.chromium.launch(
+            headless=False,  # VISIBLE BROWSER for debugging
+            slow_mo=500,     # Slow down actions by 500ms to see what's happening
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--start-maximized',
+            ]
+        )
+    else:
+        logger.info("🤖 PRODUCTION MODE: Headless browser")
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-gpu',
+                '--single-process',
+                '--no-zygote',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+            ]
+        )
     
     context = await browser.new_context(
         user_agent=random.choice(user_agents),
-        viewport={'width': 1920, 'height': 1080},
+        viewport={'width': 1920, 'height': 1080} if not DEBUG_MODE else None,  # Full screen in debug
         locale='en-US',
         timezone_id='America/New_York',
         extra_http_headers={
@@ -105,8 +120,8 @@ async def create_browser():
         }
     )
     
-    # Set generous timeout for Render
-    context.set_default_timeout(90000)  # 90 seconds
+    # Set generous timeout
+    context.set_default_timeout(90000)
     
     page = await context.new_page()
     
@@ -140,6 +155,7 @@ async def login_to_dice(page):
         await random_delay(0.5, 1)
         
         # Click continue
+        logger.info("→ Clicking continue button...")
         continue_btn = page.locator("button[data-testid='sign-in-button']")
         await continue_btn.wait_for(state="visible", timeout=20000)
         await continue_btn.click()
@@ -148,19 +164,21 @@ async def login_to_dice(page):
         # Password entry
         logger.info("→ Entering password...")
         password_input = page.locator("input[type='password']")
-        await password_input.wait_for(state="visible", timeout=30000)
+        await password_input.wait_for(state="visible", timeout=50000)
         
         for char in DICE_PASSWORD:
             await password_input.type(char, delay=random.randint(50, 120))
         await random_delay(0.5, 1.5)
         
         # Sign in
+        logger.info("→ Clicking sign in button...")
         sign_in_btn = page.locator("button[data-testid='submit-password']")
         await sign_in_btn.wait_for(state="visible", timeout=20000)
         await sign_in_btn.click()
         await random_delay(5, 8)  # Wait for redirect
         
         # Verify login
+        logger.info(f"→ Current URL: {page.url}")
         if "dashboard" in page.url or "jobs" in page.url:
             logger.info("✅ Login successful")
             return True
@@ -186,11 +204,14 @@ async def wait_for_easy_apply_button(page):
     ]
     
     # Wait for page to be fully loaded
+    logger.info("→ Waiting for page to load completely...")
     await page.wait_for_load_state('networkidle', timeout=60000)
     await asyncio.sleep(3)  # Let React hydrate
     
+    logger.info("→ Searching for Easy Apply button...")
     for selector in selectors:
         try:
+            logger.info(f"   Trying selector: {selector}")
             button = page.locator(selector).first
             await button.wait_for(state="visible", timeout=20000)
             await button.wait_for(state="enabled", timeout=10000)
@@ -199,14 +220,16 @@ async def wait_for_easy_apply_button(page):
             await button.scroll_into_view_if_needed()
             await asyncio.sleep(1)
             
-            logger.info(f"✅ Found button: {selector}")
+            logger.info(f"✅ Found button with selector: {selector}")
             return button
             
         except Exception as e:
-            logger.debug(f"Button not found with {selector}: {e}")
+            logger.debug(f"   Button not found with {selector}: {str(e)[:100]}")
             continue
     
-    raise Exception("Easy Apply button not found")
+    # If we get here, no button found - take screenshot
+    await page.screenshot(path="no_easy_apply_button.png")
+    raise Exception("Easy Apply button not found with any selector")
 
 async def apply_to_job(page, job_url):
     """Apply to job with human-like interactions"""
@@ -216,12 +239,14 @@ async def apply_to_job(page, job_url):
         logger.info(f"📝 Applying to: {job_url}")
         
         # Navigate to job
+        logger.info("→ Navigating to job page...")
         await page.goto(job_url, 
                        wait_until="networkidle",
                        timeout=90000)
         await random_delay(3, 6)
         
         # Simulate reading
+        logger.info("→ Simulating human reading behavior...")
         await human_mouse_movement(page)
         await random_delay(2, 4)
         
@@ -229,26 +254,30 @@ async def apply_to_job(page, job_url):
         logger.info("→ Looking for Easy Apply button...")
         easy_apply = await wait_for_easy_apply_button(page)
         
+        logger.info("→ Clicking Easy Apply button...")
         await random_delay(0.5, 1.5)
         await easy_apply.click(timeout=15000)
         await random_delay(3, 5)
         
         # Review form
+        logger.info("→ Reviewing application form...")
         await human_mouse_movement(page)
         await random_delay(1.5, 3)
         
         # Click Next
-        logger.info("→ Clicking Next...")
+        logger.info("→ Looking for Next button...")
         next_btn = page.locator("button[data-testid='bottom-apply-next-button']")
         await next_btn.wait_for(state="visible", timeout=30000)
+        logger.info("→ Clicking Next button...")
         await random_delay(0.5, 1)
         await next_btn.click()
         await random_delay(2, 3)
         
         # Submit
-        logger.info("→ Submitting application...")
+        logger.info("→ Looking for Submit button...")
         submit_btn = page.locator("button[data-testid='submit-application-button']")
         await submit_btn.wait_for(state="visible", timeout=30000)
+        logger.info("→ Clicking Submit button...")
         await random_delay(0.8, 1.5)
         await submit_btn.click()
         await random_delay(2, 3)
@@ -257,7 +286,7 @@ async def apply_to_job(page, job_url):
         last_application_time = datetime.now()
         application_count += 1
         
-        logger.info(f"✅ Application #{application_count} submitted")
+        logger.info(f"✅ Application #{application_count} submitted successfully!")
         
         return {
             "status": "success",
@@ -269,7 +298,9 @@ async def apply_to_job(page, job_url):
     except Exception as e:
         logger.error(f"❌ Application failed: {e}")
         try:
-            await page.screenshot(path=f"error_{int(time.time())}.png")
+            screenshot_path = f"error_{int(time.time())}.png"
+            await page.screenshot(path=screenshot_path)
+            logger.info(f"📸 Screenshot saved: {screenshot_path}")
         except:
             pass
         return {
@@ -282,7 +313,7 @@ async def apply_to_job(page, job_url):
 @app.route('/apply', methods=['POST'])
 @async_route
 async def apply_endpoint():
-    """Main API endpoint - ALWAYS creates fresh session on Render"""
+    """Main API endpoint"""
     data = request.json
     job_url = data.get('job_url')
     
@@ -296,7 +327,7 @@ async def apply_endpoint():
     browser = None
     
     try:
-        logger.info("🔄 Creating fresh browser session...")
+        logger.info("🔄 Creating browser session...")
         playwright_instance, browser, context, page = await create_browser()
         
         # Login
@@ -306,6 +337,11 @@ async def apply_endpoint():
         # Apply to job
         result = await apply_to_job(page, job_url)
         
+        # In debug mode, keep browser open for 10 seconds to see result
+        if DEBUG_MODE:
+            logger.info("🔍 Debug mode: Keeping browser open for 10 seconds...")
+            await asyncio.sleep(10)
+        
         return jsonify(result)
         
     except Exception as e:
@@ -313,7 +349,7 @@ async def apply_endpoint():
         return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
-        # ALWAYS cleanup on Render
+        # Cleanup
         try:
             if browser:
                 await browser.close()
@@ -327,17 +363,26 @@ def health():
     """Health check"""
     return jsonify({
         "status": "running",
+        "debug_mode": DEBUG_MODE,
         "applications_count": application_count,
         "last_application": last_application_time.isoformat() if last_application_time else None
     })
 
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("🚀 Dice Job Applier - Render Optimized")
+    logger.info("🚀 Dice Job Applier - Visual Debug Mode")
     logger.info("=" * 60)
     logger.info(f"📧 Email: {DICE_EMAIL}")
+    logger.info(f"🔍 Debug Mode: {DEBUG_MODE}")
     logger.info(f"⏱️  Min wait: {MIN_WAIT_BETWEEN_APPS}s")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("💡 TIP: The browser will open visibly so you can watch it work!")
+    logger.info("💡 TIP: Set DEBUG_MODE=false in production/Render")
+    logger.info("")
+    logger.info("Test with:")
+    logger.info('curl -X POST http://localhost:5000/apply -H "Content-Type: application/json" -d \'{"job_url": "https://www.dice.com/job-detail/YOUR-JOB-ID"}\'')
     logger.info("=" * 60)
     
     port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
