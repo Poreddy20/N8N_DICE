@@ -33,19 +33,13 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy requirements and install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
 RUN playwright install chromium
 
-# Copy application code
 COPY . .
 
-# Expose port
 EXPOSE 8080
 
-# Start the application
 CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "300"]
-```
