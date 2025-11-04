@@ -1,73 +1,56 @@
 from flask import Flask, request, jsonify
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
+import asyncio
 import time
 import random
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
+from functools import wraps
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Credentials (use environment variables in production)
+# Credentials
 DICE_EMAIL = os.getenv("DICE_EMAIL", "your_email@dice.com")
 DICE_PASSWORD = os.getenv("DICE_PASSWORD", "your_password")
 
-# Global session state
-browser_context = None
+# Human behavior configuration
+MIN_WAIT_BETWEEN_APPS = 120
+MAX_WAIT_BETWEEN_APPS = 180
+
+# Global tracking
 last_application_time = None
 application_count = 0
-session_start_time = None
 
-# Human behavior configuration
-MIN_WAIT_BETWEEN_APPS = 120  # 2 minutes minimum
-MAX_WAIT_BETWEEN_APPS = 180  # 3 minutes maximum
-MAX_APPS_PER_SESSION = 15    # Max applications before relogin
-SESSION_MAX_DURATION = 7200  # 2 hours max session
+def async_route(f):
+    """Decorator to handle async routes in Flask"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(f(*args, **kwargs))
+    return wrapper
 
-def random_delay(min_sec=1, max_sec=3):
-    """Simulate human thinking/reading time"""
+async def random_delay(min_sec=1, max_sec=3):
+    """Simulate human thinking time"""
     delay = random.uniform(min_sec, max_sec)
     logger.info(f"⏱️  Human delay: {delay:.2f}s")
-    time.sleep(delay)
+    await asyncio.sleep(delay)
 
-def human_mouse_movement(page):
+async def human_mouse_movement(page):
     """Simulate human-like mouse movements"""
     try:
-        # Random scrolling (humans read job descriptions)
         scroll_amount = random.randint(200, 600)
-        page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-        random_delay(0.5, 1.5)
+        await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+        await random_delay(0.5, 1.5)
         
-        # Scroll back up a bit (reading behavior)
-        page.evaluate(f"window.scrollBy(0, -{scroll_amount // 2})")
-        random_delay(0.3, 0.8)
+        await page.evaluate(f"window.scrollBy(0, -{scroll_amount // 2})")
+        await random_delay(0.3, 0.8)
         
         logger.info("🖱️  Simulated mouse movements")
     except Exception as e:
         logger.warning(f"Mouse simulation warning: {e}")
-
-def should_relogin():
-    """Determine if we need to create a new session"""
-    global last_application_time, application_count, session_start_time, browser_context
-    
-    # No browser yet
-    if browser_context is None:
-        return True
-    
-    # Too many applications in this session
-    if application_count >= MAX_APPS_PER_SESSION:
-        logger.info("⚠️  Max applications per session reached")
-        return True
-    
-    # Session too old
-    if session_start_time and (datetime.now() - session_start_time).seconds > SESSION_MAX_DURATION:
-        logger.info("⚠️  Session duration exceeded")
-        return True
-    
-    return False
 
 def enforce_human_pacing():
     """Enforce minimum time between applications"""
@@ -79,45 +62,56 @@ def enforce_human_pacing():
         
         if time_since_last < required_wait:
             wait_time = required_wait - time_since_last
-            logger.info(f"⏳ Human pacing: waiting {wait_time}s before next application")
+            logger.info(f"⏳ Pacing: waiting {wait_time}s")
             time.sleep(wait_time)
 
-def create_human_like_browser():
-    """Create browser with human-like characteristics"""
-    playwright = sync_playwright().start()
+async def create_browser():
+    """Create optimized browser for Render"""
+    playwright = await async_playwright().start()
     
-    # Rotate user agents
     user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     ]
     
-    browser = playwright.chromium.launch(
+    # Render-optimized browser launch
+    browser = await playwright.chromium.launch(
         headless=True,
         args=[
-            '--disable-blink-features=AutomationControlled',  # Hide automation
-            '--disable-dev-shm-usage',
-            '--no-sandbox'
+            '--disable-blink-features=AutomationControlled',
+            '--disable-dev-shm-usage',  # Critical for Render
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-gpu',
+            '--single-process',  # Use single process on Render
+            '--no-zygote',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
         ]
     )
     
-    context = browser.new_context(
+    context = await browser.new_context(
         user_agent=random.choice(user_agents),
         viewport={'width': 1920, 'height': 1080},
         locale='en-US',
         timezone_id='America/New_York',
-        # Add realistic browser fingerprint
         extra_http_headers={
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
         }
     )
     
+    # Set generous timeout for Render
+    context.set_default_timeout(90000)  # 90 seconds
+    
+    page = await context.new_page()
+    
     # Remove webdriver detection
-    page = context.new_page()
-    page.add_init_script("""
+    await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
         });
@@ -125,61 +119,96 @@ def create_human_like_browser():
     
     return playwright, browser, context, page
 
-def login_to_dice(page):
+async def login_to_dice(page):
     """Login with human-like behavior"""
-    global session_start_time, application_count
-    
     logger.info("🔐 Logging in to Dice.com...")
     
     try:
-        page.goto("https://www.dice.com/dashboard/login", wait_until="networkidle")
-        random_delay(2, 4)  # Read the page
+        await page.goto("https://www.dice.com/dashboard/login", 
+                       wait_until="networkidle",
+                       timeout=90000)
+        await random_delay(2, 4)
         
-        # Step 1: Email
+        # Email entry
         logger.info("→ Entering email...")
-        email_input = page.wait_for_selector("input[type='email']", timeout=10000)
+        email_input = page.locator("input[type='email']")
+        await email_input.wait_for(state="visible", timeout=30000)
         
-        # Type like a human (not instant paste)
+        # Type like human
         for char in DICE_EMAIL:
-            email_input.type(char, delay=random.randint(50, 150))
-        random_delay(0.5, 1)
+            await email_input.type(char, delay=random.randint(50, 150))
+        await random_delay(0.5, 1)
         
         # Click continue
-        continue_btn = page.wait_for_selector("button[data-testid='sign-in-button']")
-        continue_btn.click()
-        random_delay(2, 3)
+        continue_btn = page.locator("button[data-testid='sign-in-button']")
+        await continue_btn.wait_for(state="visible", timeout=20000)
+        await continue_btn.click()
+        await random_delay(2, 3)
         
-        # Step 2: Password
+        # Password entry
         logger.info("→ Entering password...")
-        password_input = page.wait_for_selector("input[type='password']", timeout=10000)
+        password_input = page.locator("input[type='password']")
+        await password_input.wait_for(state="visible", timeout=30000)
         
-        # Type password like human
         for char in DICE_PASSWORD:
-            password_input.type(char, delay=random.randint(50, 120))
-        random_delay(0.5, 1.5)
+            await password_input.type(char, delay=random.randint(50, 120))
+        await random_delay(0.5, 1.5)
         
-        # Click sign in
-        sign_in_btn = page.wait_for_selector("button[data-testid='submit-password']")
-        sign_in_btn.click()
-        random_delay(3, 5)
+        # Sign in
+        sign_in_btn = page.locator("button[data-testid='submit-password']")
+        await sign_in_btn.wait_for(state="visible", timeout=20000)
+        await sign_in_btn.click()
+        await random_delay(5, 8)  # Wait for redirect
         
         # Verify login
         if "dashboard" in page.url or "jobs" in page.url:
             logger.info("✅ Login successful")
-            session_start_time = datetime.now()
-            application_count = 0
             return True
         else:
             logger.error(f"❌ Login failed - URL: {page.url}")
-            page.screenshot(path="login_error.png")
+            await page.screenshot(path="login_error.png")
             return False
             
     except Exception as e:
         logger.error(f"❌ Login error: {e}")
-        page.screenshot(path="login_exception.png")
+        try:
+            await page.screenshot(path="login_exception.png")
+        except:
+            pass
         return False
 
-def apply_to_job(page, job_url, behavior_profile):
+async def wait_for_easy_apply_button(page):
+    """Wait for Easy Apply button with multiple strategies"""
+    selectors = [
+        "button[data-cy='apply-button-card']",
+        "button:has-text('Easy Apply')",
+        "button:has-text('Apply')",
+    ]
+    
+    # Wait for page to be fully loaded
+    await page.wait_for_load_state('networkidle', timeout=60000)
+    await asyncio.sleep(3)  # Let React hydrate
+    
+    for selector in selectors:
+        try:
+            button = page.locator(selector).first
+            await button.wait_for(state="visible", timeout=20000)
+            await button.wait_for(state="enabled", timeout=10000)
+            
+            # Scroll into view
+            await button.scroll_into_view_if_needed()
+            await asyncio.sleep(1)
+            
+            logger.info(f"✅ Found button: {selector}")
+            return button
+            
+        except Exception as e:
+            logger.debug(f"Button not found with {selector}: {e}")
+            continue
+    
+    raise Exception("Easy Apply button not found")
+
+async def apply_to_job(page, job_url):
     """Apply to job with human-like interactions"""
     global last_application_time, application_count
     
@@ -187,46 +216,48 @@ def apply_to_job(page, job_url, behavior_profile):
         logger.info(f"📝 Applying to: {job_url}")
         
         # Navigate to job
-        page.goto(job_url, wait_until="networkidle")
-        random_delay(3, 6)  # Read job description
+        await page.goto(job_url, 
+                       wait_until="networkidle",
+                       timeout=90000)
+        await random_delay(3, 6)
         
-        # Simulate reading behavior
-        human_mouse_movement(page)
-        random_delay(2, 4)
+        # Simulate reading
+        await human_mouse_movement(page)
+        await random_delay(2, 4)
         
-        # Click Easy Apply
-        logger.info("→ Clicking Easy Apply...")
-        easy_apply = page.wait_for_selector("button[data-cy='apply-button-card']", timeout=15000)
-        random_delay(0.5, 1.5)  # Hesitate before clicking
-        easy_apply.click()
-        random_delay(2, 3)
+        # Find and click Easy Apply
+        logger.info("→ Looking for Easy Apply button...")
+        easy_apply = await wait_for_easy_apply_button(page)
         
-        # Review application form (humans read before clicking next)
-        human_mouse_movement(page)
-        random_delay(1.5, 3)
+        await random_delay(0.5, 1.5)
+        await easy_apply.click(timeout=15000)
+        await random_delay(3, 5)
+        
+        # Review form
+        await human_mouse_movement(page)
+        await random_delay(1.5, 3)
         
         # Click Next
         logger.info("→ Clicking Next...")
-        next_btn = page.wait_for_selector("button[data-testid='bottom-apply-next-button']", timeout=15000)
-        random_delay(0.5, 1)
-        next_btn.click()
-        random_delay(2, 3)
+        next_btn = page.locator("button[data-testid='bottom-apply-next-button']")
+        await next_btn.wait_for(state="visible", timeout=30000)
+        await random_delay(0.5, 1)
+        await next_btn.click()
+        await random_delay(2, 3)
         
-        # Final review before submit
-        random_delay(1, 2)
-        
-        # Click Submit
+        # Submit
         logger.info("→ Submitting application...")
-        submit_btn = page.wait_for_selector("button[data-testid='submit-application-button']", timeout=15000)
-        random_delay(0.8, 1.5)  # Brief hesitation
-        submit_btn.click()
-        random_delay(2, 3)
+        submit_btn = page.locator("button[data-testid='submit-application-button']")
+        await submit_btn.wait_for(state="visible", timeout=30000)
+        await random_delay(0.8, 1.5)
+        await submit_btn.click()
+        await random_delay(2, 3)
         
         # Update tracking
         last_application_time = datetime.now()
         application_count += 1
         
-        logger.info(f"✅ Application #{application_count} submitted successfully")
+        logger.info(f"✅ Application #{application_count} submitted")
         
         return {
             "status": "success",
@@ -237,7 +268,10 @@ def apply_to_job(page, job_url, behavior_profile):
         
     except Exception as e:
         logger.error(f"❌ Application failed: {e}")
-        page.screenshot(path="application_error.png")
+        try:
+            await page.screenshot(path=f"error_{int(time.time())}.png")
+        except:
+            pass
         return {
             "status": "failed",
             "job_url": job_url,
@@ -246,81 +280,63 @@ def apply_to_job(page, job_url, behavior_profile):
         }
 
 @app.route('/apply', methods=['POST'])
-def apply_endpoint():
-    """Main API endpoint for job applications"""
-    global browser_context
-    
+@async_route
+async def apply_endpoint():
+    """Main API endpoint - ALWAYS creates fresh session on Render"""
     data = request.json
     job_url = data.get('job_url')
-    behavior_profile = data.get('behavior_profile', {})
     
     if not job_url:
-        return jsonify({"status": "error", "message": "No job URL provided"}), 400
+        return jsonify({"status": "error", "message": "No job URL"}), 400
     
-    # Enforce human pacing
+    # Enforce pacing
     enforce_human_pacing()
     
     playwright_instance = None
     browser = None
     
     try:
-        # Check if we need new session
-        if should_relogin():
-            logger.info("🔄 Creating new browser session...")
-            playwright_instance, browser, browser_context, page = create_human_like_browser()
-            
-            if not login_to_dice(page):
-                return jsonify({
-                    "status": "error",
-                    "message": "Login failed"
-                }), 500
-        else:
-            # Reuse existing session
-            page = browser_context.new_page()
-            logger.info("♻️  Reusing existing session")
+        logger.info("🔄 Creating fresh browser session...")
+        playwright_instance, browser, context, page = await create_browser()
+        
+        # Login
+        if not await login_to_dice(page):
+            return jsonify({"status": "error", "message": "Login failed"}), 500
         
         # Apply to job
-        result = apply_to_job(page, job_url, behavior_profile)
+        result = await apply_to_job(page, job_url)
         
         return jsonify(result)
         
     except Exception as e:
         logger.error(f"❌ Critical error: {e}")
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
-        if page:
-            page.close()
+        # ALWAYS cleanup on Render
+        try:
+            if browser:
+                await browser.close()
+            if playwright_instance:
+                await playwright_instance.stop()
+        except:
+            pass
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
+    """Health check"""
     return jsonify({
         "status": "running",
-        "session_active": browser_context is not None,
         "applications_count": application_count,
         "last_application": last_application_time.isoformat() if last_application_time else None
     })
 
-@app.route('/reset', methods=['POST'])
-def reset_session():
-    """Force session reset"""
-    global browser_context, application_count, session_start_time
-    browser_context = None
-    application_count = 0
-    session_start_time = None
-    return jsonify({"status": "success", "message": "Session reset"})
-
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("🚀 Dice Job Applier - Cloud Ready")
+    logger.info("🚀 Dice Job Applier - Render Optimized")
     logger.info("=" * 60)
     logger.info(f"📧 Email: {DICE_EMAIL}")
-    logger.info(f"⏱️  Min wait between apps: {MIN_WAIT_BETWEEN_APPS}s")
-    logger.info(f"📊 Max apps per session: {MAX_APPS_PER_SESSION}")
+    logger.info(f"⏱️  Min wait: {MIN_WAIT_BETWEEN_APPS}s")
     logger.info("=" * 60)
     
     port = int(os.getenv("PORT", 5000))
